@@ -25,6 +25,7 @@
 import express from 'express';
 import _ from 'underscore';
 
+import {BuildSystems} from '../../shared/build-systems.js';
 import {isString, unique} from '../../shared/common-utils.js';
 import {CompilerInfo} from '../../types/compiler.interfaces.js';
 import {Language, LanguageKey} from '../../types/languages.interfaces.js';
@@ -38,6 +39,7 @@ import {ClientOptionsHandler, VersionInfo} from '../options-handler.js';
 import {PropertyGetter} from '../properties.interfaces.js';
 import {SentryCapture} from '../sentry.js';
 import {BaseShortener, getShortenerTypeByKey} from '../shortener/index.js';
+import {ShortLinkNotFoundError} from '../storage/base.js';
 import {StorageBase} from '../storage/index.js';
 import {CompileHandler} from './compile.js';
 
@@ -106,6 +108,11 @@ export class ApiHandler {
             .post(textParser, compileHandler.handle.bind(compileHandler))
             .all(methodNotAllowed);
         this.handle
+            .route('/compiler/:compiler/build/:buildSystem')
+            .post(compileHandler.handleBuildProject.bind(compileHandler))
+            .all(methodNotAllowed);
+        // The original, CMake-only spelling of the above. Documented API, so it stays.
+        this.handle
             .route('/compiler/:compiler/cmake')
             .post(compileHandler.handleCmake.bind(compileHandler))
             .all(methodNotAllowed);
@@ -160,7 +167,7 @@ export class ApiHandler {
             .catch(err => {
                 logger.warn(`Exception thrown when expanding ${id}: `, err);
                 logger.warn('Exception value:', err);
-                SentryCapture(err, 'shortlinkInfoHandler');
+                if (!(err instanceof ShortLinkNotFoundError)) SentryCapture(err, 'shortlinkInfoHandler');
                 next({
                     statusCode: 404,
                     message: `ID "${id}" could not be found`,
@@ -173,15 +180,19 @@ export class ApiHandler {
     }
 
     getAvailableLanguages(): Language[] {
-        // Always expose cmake to the frontend even if no compiler reports it as
-        // its language, so IDE/tree mode (CMakeLists.txt) can resolve it.
-        const langIds = unique([...this.usedLangIds, ...(this.languages.cmake ? (['cmake'] as LanguageKey[]) : [])]);
+        // Always expose the build system manifest languages to the frontend even if no compiler reports them as its
+        // language, so IDE/tree mode (CMakeLists.txt, Cargo.toml) can resolve them.
+        const manifestLangIds = Object.values(BuildSystems)
+            .map(buildSystem => buildSystem.manifestLanguageId)
+            .filter(langId => this.languages[langId]);
+        const langIds = unique([...this.usedLangIds, ...manifestLangIds]);
         return langIds.map(val => {
             const lang = this.languages[val];
             const newLangObj: Language = Object.assign({}, lang);
             if (this.options) {
                 newLangObj.defaultCompiler = this.options.options.defaultCompiler[unwrap(lang).id];
                 newLangObj.defaultLibs = this.options.options.defaultLibs[unwrap(lang).id];
+                newLangObj.defaultOptions = this.options.options.compileOptions[unwrap(lang).id];
             }
             return newLangObj;
         });
@@ -199,7 +210,10 @@ export class ApiHandler {
     }
 
     outputList(list: CompilerInfo[] | Language[], title: string, req: express.Request, res: express.Response) {
-        if (req.accepts(['text', 'json']) === 'json') {
+        res.vary('Accept');
+        // The plain-text table can't honour `fields`, so a request that asks for specific fields is always a JSON client,
+        // even when the Accept header was lost or rewritten on the way here.
+        if (req.accepts(['text', 'json']) === 'json' || req.query.fields !== undefined) {
             if (req.query.fields === 'all') {
                 res.send(list);
             } else {
@@ -316,6 +330,7 @@ export class ApiHandler {
                 languageId: tool.tool.languageId || languageId,
                 allowStdin: tool.tool.stdinHint !== 'disabled',
                 args: tool.tool.args,
+                argChoices: tool.tool.argChoices,
                 monacoStdin: tool.tool.monacoStdin,
                 icon: tool.tool.icon,
                 darkIcon: tool.tool.darkIcon,
